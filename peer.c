@@ -60,54 +60,14 @@ int main(int argc, char **argv) {
 #define ACK 4
 #define DENIED 5
 #define HASHSTRLEN 41
-void strtohex(char *hexstring, char *dststring);
-int readhash(char *fname, char **hasharray)
-{
-    FILE *fp = fopen(fname, "r");
-    int i = 0, id;
-    char strhash[HASHSTRLEN];
-    while (fscanf(fp, "%d %s\n", &id, strhash) != EOF) {
-        strtohex(strhash, hasharray[i]);
-        i++;
-    }
-    return i;
-}
 #define MAXHASHHASNUM 300
-void process_inbound_udp(int sock, bt_config_t *config) {
-#define BUFLEN 1500
-    struct sockaddr_in from;
-    socklen_t fromlen;
-    char buf[BUFLEN];
-    char hashs[MAXHASHHASNUM][HASHSIZE];
-
-    fromlen = sizeof(from);
-    spiffy_recvfrom(sock, buf, BUFLEN, 0, (struct sockaddr *) &from, &fromlen);
-
-    char type = *(buf+8);
-    FILE *fp = fopen(config->has_chunk_file, "r");
-
-    switch (type) {
-        case WHOHAS:
-            readhash(config->has_chunk_file, hashs);
-            send_IHAVE(sock, &from, &fromlen, hash);
-            break;
-        default:
-            printf("Not implement method type %d\n", type);
-    
-    printf("PROCESS_INBOUND_UDP SKELETON -- replace!\n"
-            "Incoming message from %s:%d\n%s\n\n", 
-            inet_ntoa(from.sin_addr),
-            ntohs(from.sin_port),
-            buf);
-
-}
-#define WINDOWSIZE 8
 #define HASHSIZE 20
+#define WINDOWSIZE 8
 #define WHOHASPAYLOADNUM 20
 #define MAXLINE 1024
 #define HEADERLEN 16
 #define MAXHASHNUM (1500-HEADERLEN)/HASHSIZE
-
+#define HEADERPLUSPADING 20
 typedef struct header_s {
     uint16_t magicnum;
     char version;
@@ -117,6 +77,96 @@ typedef struct header_s {
     uint32_t seq_num;
     uint32_t ack_num;
 } header_t;
+
+typedef struct ihave_packet {
+    header_t header;
+    char hashnum; 
+    char pading[3];
+    char hash[HASHSIZE*WHOHASPAYLOADNUM];
+} ihave_packet_t;
+
+
+void strtohex(char *hexstring, char *dststring);
+int readhash(char *fname, char hasharray[][HASHSIZE])
+{
+    FILE *fp = fopen(fname, "r");
+    int i = 0, id;
+    char strhash[HASHSTRLEN];
+    while (fscanf(fp, "%d %s\n", &id, strhash) != EOF) {
+#ifdef DEBUG
+        printf("Fun:readhash(), hashid:%d hash:%s\n", id, strhash);
+#endif
+        strtohex(strhash, hasharray[i]);
+        i++;
+    }
+    return i;
+}
+
+void send_ihave(int sockfd, struct sockaddr_in *from, socklen_t len, char hashashs[][HASHSIZE]
+        , int hasnum, char queryhashs[][HASHSIZE], int querynum) {
+
+    ihave_packet_t ihave;
+    bzero(&ihave, sizeof(ihave));
+    ihave.header.magicnum = htons(15411);
+    ihave.header.version = 1;
+    ihave.header.packet_type = 1;
+    ihave.header.header_len = htons(16);
+
+    /* 20 bytes if the offset to hashs payload */
+    char (*p)[HASHSIZE] = (char (*)[HASHSIZE])((char *)&ihave + HEADERPLUSPADING);
+
+    int i, j, hitnum;
+    hitnum = 0;
+    for (i = 0; i < querynum; i++) {
+        for (j = 0; j < hasnum; j++) {
+            if (memcmp(queryhashs[i], hashashs[j], HASHSIZE) == 0) {
+                memcpy(p+hitnum, hashashs[j], HASHSIZE);
+                hitnum++;
+            }
+        }
+    }
+#ifdef DEBUG
+    printf("send_Ihave() hitnum is %d\n", hitnum);
+#endif
+    ihave.hashnum = hitnum;
+    uint16_t packet_len = hitnum * HASHSIZE + HEADERPLUSPADING;
+    ihave.header.packet_len = htons(packet_len);
+    spiffy_sendto(sockfd, &ihave, packet_len, 0, (struct sockaddr*)from, len);
+}
+
+void process_ihave(int sock, char buf[], struct sockaddr_in* from, socklen_t len, bt_config_t *config) {
+#ifdef DEBUG
+    printf("Receive a ihave packet Now is processing\n");
+#endif
+    char hashashs[MAXHASHHASNUM][HASHSIZE];
+    char (*queryhashs)[HASHSIZE];
+    uint16_t querynum;
+    int hasnum;
+
+    querynum = *(char *)(void *)((buf+16));
+    hasnum = readhash(config->has_chunk_file, hashashs);
+    queryhashs = (char (*)[HASHSIZE])(buf+HEADERPLUSPADING);
+    send_ihave(sock, from, len, hashashs, hasnum, queryhashs, querynum);
+}
+
+void process_inbound_udp(int sock, bt_config_t *config) {
+#define BUFLEN 1500
+    struct sockaddr_in from;
+    socklen_t fromlen;
+    char buf[BUFLEN];
+
+    fromlen = sizeof(from);
+    spiffy_recvfrom(sock, buf, BUFLEN, 0, (struct sockaddr *) &from, &fromlen);
+    char type = *(buf+8);
+    switch (type) {
+        case WHOHAS:
+            process_ihave(sock, buf, &from, fromlen, config);
+            break;
+        default:
+            printf("Not implement method type %d\n", type);
+    }
+}
+
 
 typedef struct data_packet {
     header_t header;
@@ -202,6 +252,8 @@ void handle_user_input(char *line, void *cbdata, bt_config_t *config) {
     bzero(chunkf, sizeof(chunkf));
     bzero(outf, sizeof(outf));
 
+    char *p = (char *)cbdata;
+    p++;
     if (sscanf(line, "GET %120s %120s", chunkf, outf)) {
         if (strlen(outf) > 0) {
             process_get(chunkf, outf, config);
@@ -252,7 +304,7 @@ void peer_run(bt_config_t *config) {
 
             if (FD_ISSET(STDIN_FILENO, &readfds)) {
                 process_user_input(STDIN_FILENO, userbuf, handle_user_input,
-                        "Currently unused", config);
+                        (void*)"Currently unused", config);
             }
         }
     }
